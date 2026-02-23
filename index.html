@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Face Game - Mobile Portrait</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <style>
+        body { 
+            margin: 0; 
+            overflow: hidden; 
+            background: #000; 
+            font-family: 'Helvetica', 'Arial', sans-serif; 
+            height: 100dvh;
+            width: 100vw;
+        }
+        canvas { 
+            display: block; 
+            width: 100%; 
+            height: 100%; 
+            object-fit: cover; 
+            transform: scaleX(-1); 
+        }
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none; color: white; text-shadow: 2px 2px 4px #000;
+            z-index: 10;
+        }
+        .info-container {
+            position: absolute; top: env(safe-area-inset-top, 20px); 
+            left: 0; width: 100%;
+            display: flex; justify-content: space-around; align-items: center;
+        }
+        .info { font-size: 24px; font-weight: bold; }
+        #score { color: #0f0; }
+        #timer { color: #f00; }
+        #msg { 
+            position: absolute; top: 50%; left: 50%; 
+            transform: translate(-50%, -50%); 
+            font-size: 24px; text-align: center; color: #0f0;
+            white-space: pre-wrap; width: 80%;
+            pointer-events: auto;
+        }
+        #overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.7); display: flex; flex-direction: column;
+            justify-content: center; align-items: center; z-index: 100;
+            color: white; font-size: 20px; text-align: center;
+        }
+        button {
+            padding: 15px 30px; font-size: 20px; margin-top: 20px;
+            background: #0f0; border: none; border-radius: 10px; font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="overlay">
+        <p>顔で操作するゲームです</p>
+        <button onclick="startApp()">カメラを起動して開始</button>
+    </div>
+
+    <video id="input_video" style="display:none" playsinline></video>
+    <canvas id="output_canvas"></canvas>
+    
+    <div id="ui-layer">
+        <div class="info-container">
+            <div id="score" class="info">Score: 0</div>
+            <div id="timer" class="info">Time: 40</div>
+        </div>
+        <div id="msg"></div>
+    </div>
+
+<script>
+const videoElement = document.getElementById('input_video');
+const canvasElement = document.getElementById('output_canvas');
+const canvasCtx = canvasElement.getContext('2d');
+const scoreElement = document.getElementById('score');
+const timerElement = document.getElementById('timer');
+const msgElement = document.getElementById('msg');
+const overlay = document.getElementById('overlay');
+
+let score = 0;
+let gameStarted = false;
+let startTime = 0;
+const gameDuration = 40; 
+let countdown = gameDuration;
+
+let fpo1x = 0.5, fpo1y = 0.5; 
+let hiritu = 1.0;
+let currentCount = 1;
+let circles = [];
+let circleRadius = 40;
+
+let canScore = true;
+let hasClosedMouth = true;
+let isCoolDown = false;
+let audioCtx = null;
+
+function startApp() {
+    overlay.style.display = 'none';
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    camera.start();
+    speak("カメラを起動します");
+}
+
+const speech = window.speechSynthesis;
+function speak(text) {
+    if (speech.speaking) speech.cancel();
+    const uttr = new SpeechSynthesisUtterance(text);
+    uttr.lang = 'ja-JP';
+    speech.speak(uttr);
+}
+
+function beep() {
+    try {
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        const osc = audioCtx.createOscillator();
+        const gainNode = audioCtx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(1000, audioCtx.currentTime);
+        osc.connect(gainNode);
+        gainNode.connect(audioCtx.destination);
+        const now = audioCtx.currentTime;
+        osc.start(now);
+        gainNode.gain.setValueAtTime(0, now);
+        gainNode.gain.linearRampToValueAtTime(0.2, now + 0.02);
+        gainNode.gain.exponentialRampToValueAtTime(0.0001, now + 0.2);
+        osc.stop(now + 0.2);
+    } catch(e) { console.error(e); }
+}
+
+function initCircles() {
+    const w = canvasElement.width;
+    const h = canvasElement.height;
+    // 左右の間隔を1.5倍に拡大 (0.3/0.7 から 0.2/0.8 へ)
+    const positions = [
+        {x: 0.2, y: 0.2}, {x: 0.8, y: 0.2},
+        {x: 0.2, y: 0.4}, {x: 0.8, y: 0.4},
+        {x: 0.2, y: 0.6}, {x: 0.8, y: 0.6},
+        {x: 0.2, y: 0.8}, {x: 0.8, y: 0.8}
+    ];
+    circleRadius = w * 0.12;
+    let nums = [1, 2, 3, 4, 5, 6, 7, 8].sort(() => Math.random() - 0.5);
+    circles = positions.map((p, i) => ({ 
+        x: p.x * w, 
+        y: p.y * h, 
+        num: nums[i], 
+        active: true 
+    }));
+}
+
+function onResults(results) {
+    if (canvasElement.width !== window.innerWidth || canvasElement.height !== window.innerHeight) {
+        canvasElement.width = window.innerWidth;
+        canvasElement.height = window.innerHeight;
+        if(gameStarted) initCircles();
+    }
+
+    canvasCtx.save();
+    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+    
+    const vW = videoElement.videoWidth;
+    const vH = videoElement.videoHeight;
+    const sRatio = Math.max(canvasElement.width / vW, canvasElement.height / vH);
+    const drawW = vW * sRatio;
+    const drawH = vH * sRatio;
+    const drawX = (canvasElement.width - drawW) / 2;
+    const drawY = (canvasElement.height - drawH) / 2;
+    canvasCtx.drawImage(results.image, drawX, drawY, drawW, drawH);
+
+    if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+        const landmarks = results.multiFaceLandmarks[0];
+        const w = canvasElement.width;
+        const h = canvasElement.height;
+
+        hiritu = (landmarks[152].y - landmarks[10].y) / 0.35;
+        const po1x = landmarks[1].x;
+        const po1y = landmarks[1].y;
+
+        // 感度を微調整（画面端まで届きやすくするため少し数値を大きくしています）
+        const xx = 0.5 - (fpo1x - po1x) * 3.5; 
+        const relativeY = 0.5 - (fpo1y - po1y) * 4.5; 
+        
+        let thresholdMultiplier = 0.015 - (Math.max(0, Math.min(1, relativeY)) * 0.008);
+        const mouthOpen = (landmarks[14].y - landmarks[13].y) > thresholdMultiplier * hiritu;
+
+        const noseRadius = (Math.abs(landmarks[195].y - landmarks[94].y) * h) / 2;
+        canvasCtx.fillStyle = mouthOpen ? "red" : "yellow"; 
+        canvasCtx.beginPath();
+        canvasCtx.arc(landmarks[4].x * w, landmarks[4].y * h, noseRadius, 0, 2 * Math.PI);
+        canvasCtx.fill();
+
+        if (!mouthOpen) {
+            canScore = true;
+            hasClosedMouth = true;
+        }
+
+        if (!gameStarted) {
+            if (isCoolDown) {
+                msgElement.innerText = "終了！ スコア: " + score;
+            } else if (!hasClosedMouth) {
+                msgElement.innerText = "一度口を閉じてください";
+            } else {
+                msgElement.innerText = "口を大きく開けて\nスタート！";
+                if (mouthOpen) {
+                    fpo1x = landmarks[1].x;
+                    fpo1y = landmarks[1].y;
+                    gameStarted = true;
+                    startTime = Date.now();
+                    score = 0;
+                    currentCount = 1;
+                    canScore = false; 
+                    initCircles();
+                    speak("スタート");
+                }
+            }
+        } else {
+            msgElement.innerText = "";
+            const elapsed = Math.floor((Date.now() - startTime) / 1000);
+            countdown = Math.max(0, gameDuration - elapsed);
+            timerElement.innerText = `Time: ${countdown}`;
+
+            if (countdown <= 0) {
+                gameStarted = false;
+                hasClosedMouth = false;
+                isCoolDown = true;
+                speak(score + "点です。終了");
+                setTimeout(() => { isCoolDown = false; }, 3000);
+            }
+
+            const cursorX = xx * w;
+            const cursorY = relativeY * h;
+
+            circles.forEach(c => {
+                if (!c.active) return;
+                canvasCtx.save();
+                canvasCtx.globalAlpha = 0.8; 
+                canvasCtx.beginPath();
+                canvasCtx.arc(c.x, c.y, circleRadius, 0, 2 * Math.PI);
+                // 強調表示なし（常に赤色）
+                canvasCtx.fillStyle = "red";
+                canvasCtx.fill();
+                
+                canvasCtx.save();
+                canvasCtx.scale(-1, 1); 
+                canvasCtx.fillStyle = "white";
+                canvasCtx.font = `bold ${circleRadius}px Arial`;
+                canvasCtx.textAlign = "center";
+                canvasCtx.textBaseline = "middle";
+                canvasCtx.fillText(c.num, -c.x, c.y);
+                canvasCtx.restore();
+                canvasCtx.restore();
+
+                const dist = Math.sqrt((cursorX - c.x)**2 + (cursorY - c.y)**2);
+                if (dist < circleRadius && mouthOpen && canScore && c.num === currentCount) {
+                    c.active = false;
+                    score++;
+                    currentCount++;
+                    canScore = false; 
+                    scoreElement.innerText = `Score: ${score}`;
+                    beep();
+                }
+            });
+
+            if (currentCount > 8) {
+                initCircles();
+                currentCount = 1;
+            }
+
+            canvasCtx.beginPath();
+            canvasCtx.arc(cursorX, cursorY, circleRadius * 1.2, 0, 2 * Math.PI);
+            canvasCtx.strokeStyle = mouthOpen ? "#FF69B4" : "#00FF00"; 
+            canvasCtx.lineWidth = 6;
+            canvasCtx.stroke();
+        }
+    } else {
+        if (gameStarted) msgElement.innerText = "顔を写してください";
+    }
+    canvasCtx.restore();
+}
+
+const faceMesh = new FaceMesh({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+});
+
+faceMesh.setOptions({
+    maxNumFaces: 1,
+    refineLandmarks: false,
+    minDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.6
+});
+
+faceMesh.onResults(onResults);
+
+const camera = new Camera(videoElement, {
+    onFrame: async () => {
+        await faceMesh.send({image: videoElement});
+    },
+    width: 640,
+    height: 480
+});
+
+window.addEventListener('keydown', (e) => {
+    if (e.key === "Escape") location.reload();
+});
+</script>
+</body>
+</html>
